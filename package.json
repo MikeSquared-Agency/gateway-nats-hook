@@ -1,10 +1,11 @@
 {
   "name": "gateway-nats-hook",
   "version": "1.0.0",
-  "type": "module",
   "description": "OpenClaw workspace hook that publishes session transcript chunks to NATS",
+  "type": "module",
   "main": "handler.ts",
   "scripts": {
+    "lint": "biome check .",
     "test": "node --import tsx --test --test-force-exit handler.test.ts",
     "typecheck": "tsc --noEmit"
   },
@@ -12,6 +13,7 @@
     "nats": "^2.29.0"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.3.15",
     "@types/node": "^25.2.3",
     "tsx": "^4.19.3",
     "typescript": "^5.9.3"
