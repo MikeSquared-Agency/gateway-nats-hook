@@ -29,6 +29,32 @@ describe("parseSessionKey", () => {
     assert.deepEqual(meta, {});
   });
 
+  it("returns empty object for two-part key", () => {
+    const meta = parseSessionKey("channel:agent");
+    assert.deepEqual(meta, {});
+  });
+
+  it("returns empty object for empty string", () => {
+    const meta = parseSessionKey("");
+    assert.deepEqual(meta, {});
+  });
+
+  it("handles exactly 3 parts", () => {
+    const meta = parseSessionKey("web:user1:bot");
+    assert.equal(meta.channel, "web");
+    assert.equal(meta.participant, "user1");
+    assert.equal(meta.agent_id, "bot");
+  });
+
+  it("applies partial context overrides", () => {
+    const meta = parseSessionKey("whatsapp:+447444361435:main", {
+      channel: "sms",
+    });
+    assert.equal(meta.channel, "sms");
+    assert.equal(meta.participant, "+447444361435");
+    assert.equal(meta.agent_id, "main");
+  });
+
   it("context fields override parsed key", () => {
     const meta = parseSessionKey("whatsapp:+447444361435:main", {
       channel: "web",
@@ -259,6 +285,156 @@ describe("handler integration", () => {
       context: { messages: [{ role: "user", content: "lost" }] },
     });
     assert.equal(buffers.size, 0);
+  });
+
+  it("ignores unknown event types", async () => {
+    await handler({
+      type: "unknown",
+      action: "something",
+      sessionKey: SESSION_KEY,
+    });
+    assert.equal(buffers.size, 0);
+    assert.equal(received.length, 0);
+  });
+
+  it("handles session:after with no context.messages", async () => {
+    await handler({
+      type: "session",
+      action: "after",
+      sessionKey: SESSION_KEY,
+      context: {},
+    });
+
+    const buf = buffers.get(SESSION_KEY);
+    assert.ok(buf, "session buffer should be created");
+    assert.equal(buf.messages.length, 0, "no messages should be buffered");
+  });
+
+  it("handles session:after with empty messages array", async () => {
+    await handler({
+      type: "session",
+      action: "after",
+      sessionKey: SESSION_KEY,
+      context: { messages: [] },
+    });
+
+    const buf = buffers.get(SESSION_KEY);
+    assert.ok(buf, "session buffer should be created");
+    assert.equal(buf.messages.length, 0);
+  });
+
+  it("isolates multiple concurrent sessions", async () => {
+    const KEY_A = "web:alice:main";
+    const KEY_B = "slack:bob:kai";
+
+    await handler({
+      type: "session",
+      action: "after",
+      sessionKey: KEY_A,
+      context: {
+        messages: [{ role: "user", content: "from alice", timestamp: new Date().toISOString() }],
+      },
+    });
+    await handler({
+      type: "session",
+      action: "after",
+      sessionKey: KEY_B,
+      context: {
+        messages: [
+          { role: "user", content: "from bob 1", timestamp: new Date().toISOString() },
+          { role: "user", content: "from bob 2", timestamp: new Date().toISOString() },
+        ],
+      },
+    });
+
+    assert.equal(buffers.get(KEY_A)!.messages.length, 1);
+    assert.equal(buffers.get(KEY_B)!.messages.length, 2);
+
+    // Stop only session A
+    await handler({ type: "command", action: "stop", sessionKey: KEY_A });
+    await delay(100);
+
+    assert.equal(received.length, 1);
+    assert.equal(received[0].session_key, KEY_A);
+    assert.equal(received[0].message_count, 1);
+
+    // Session B still active
+    assert.ok(buffers.has(KEY_B));
+    assert.equal(buffers.get(KEY_B)!.messages.length, 2);
+
+    // Clean up session B
+    await handler({ type: "command", action: "stop", sessionKey: KEY_B });
+    await delay(100);
+  });
+
+  it("cleans up buffer on final flush with existing but empty buffer", async () => {
+    // Create a session, then flush manually to empty it, then stop
+    await handler({
+      type: "session",
+      action: "after",
+      sessionKey: SESSION_KEY,
+      context: {
+        messages: [{ role: "user", content: "hi", timestamp: new Date().toISOString() }],
+      },
+    });
+
+    // Manually flush (non-final) to empty the buffer
+    await flushSession(SESSION_KEY, "manual", false);
+    await delay(50);
+
+    assert.ok(buffers.has(SESSION_KEY), "session should still be tracked");
+    assert.equal(buffers.get(SESSION_KEY)!.messages.length, 0);
+
+    // Now final stop on empty buffer — should clean up without publishing
+    received.length = 0;
+    await handler({ type: "command", action: "stop", sessionKey: SESSION_KEY });
+    await delay(50);
+
+    assert.equal(received.length, 0, "should not publish an empty chunk");
+    assert.equal(buffers.has(SESSION_KEY), false, "session should be cleaned up");
+  });
+
+  it("chunk contains valid UUID and ISO timestamp", async () => {
+    await handler({
+      type: "session",
+      action: "after",
+      sessionKey: SESSION_KEY,
+      context: {
+        messages: [{ role: "user", content: "test", timestamp: new Date().toISOString() }],
+      },
+    });
+    await handler({ type: "command", action: "stop", sessionKey: SESSION_KEY });
+    await delay(100);
+
+    const chunk = received[0];
+    assert.match(
+      chunk.chunk_id,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+      "chunk_id should be a valid UUID"
+    );
+    assert.ok(
+      !isNaN(Date.parse(chunk.flushed_at)),
+      "flushed_at should be a valid ISO timestamp"
+    );
+  });
+
+  it("gateway:startup is idempotent", async () => {
+    // startup was already called in before() — calling again should not throw
+    await handler({ type: "gateway", action: "startup" });
+    // Verify handler still works by buffering + flushing
+    await handler({
+      type: "session",
+      action: "after",
+      sessionKey: SESSION_KEY,
+      context: {
+        messages: [{ role: "user", content: "after double startup", timestamp: new Date().toISOString() }],
+      },
+    });
+    await handler({ type: "command", action: "stop", sessionKey: SESSION_KEY });
+    await delay(100);
+
+    assert.equal(received.length, 1);
+    assert.equal(received[0].messages[0].content, "after double startup");
   });
 });
 
