@@ -1,4 +1,6 @@
-import { connect, NatsConnection, StringCodec } from "nats";
+import nats from "nats";
+const { connect, StringCodec } = nats;
+type NatsConnection = ReturnType<typeof connect> extends Promise<infer T> ? T : never;
 
 let nc: NatsConnection | null = null;
 const sc = StringCodec();
@@ -35,21 +37,30 @@ export default async function handler(event: any) {
 async function fetchTokenFromAlexandria(): Promise<string | undefined> {
   const alexandriaUrl =
     process.env.ALEXANDRIA_URL || "http://127.0.0.1:8500";
-  try {
-    const res = await fetch(
-      `${alexandriaUrl}/api/v1/secrets/NATS_TOKEN`,
-      { headers: { "X-Agent-ID": "gateway" } }
-    );
-    if (!res.ok) return undefined;
-    const body = (await res.json()) as { data?: { value?: string } };
-    return body?.data?.value;
-  } catch {
-    return undefined;
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await fetch(
+        `${alexandriaUrl}/api/v1/secrets/NATS_TOKEN`,
+        { headers: { "X-Agent-ID": "gateway" } }
+      );
+      if (!res.ok) return undefined;
+      const body = (await res.json()) as { data?: { value?: string } };
+      return body?.data?.value;
+    } catch {
+      if (attempt < maxAttempts) {
+        console.warn(
+          `[nats-publisher] Alexandria attempt ${attempt}/${maxAttempts} failed, retrying in 1s…`
+        );
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
   }
+  return undefined;
 }
 
 async function initNats() {
-  if (nc) return;
+  if (nc && !nc.isClosed()) return;
   const url = process.env.NATS_URL || "nats://127.0.0.1:4222";
   const token =
     (await fetchTokenFromAlexandria()) || process.env.NATS_TOKEN;
@@ -66,8 +77,15 @@ async function initNats() {
   try {
     nc = await connect(opts);
     console.log(`[nats-publisher] connected to ${url}`);
+
+    // Reset nc on unexpected disconnect so subsequent calls re-init
+    nc.closed().then(() => {
+      console.warn("[nats-publisher] NATS connection closed, will reconnect on next use");
+      nc = null;
+    });
   } catch (err) {
     console.error("[nats-publisher] failed to connect:", err);
+    nc = null;
   }
 }
 

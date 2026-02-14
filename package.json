@@ -1,6 +1,7 @@
 {
   "name": "gateway-nats-hook",
   "version": "1.0.0",
+  "type": "module",
   "description": "OpenClaw workspace hook that publishes session transcript chunks to NATS",
   "main": "handler.ts",
   "scripts": {
