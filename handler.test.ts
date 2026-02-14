@@ -1,11 +1,8 @@
-import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { connect, StringCodec, type NatsConnection } from "nats";
-import handler, {
-  parseSessionKey,
-  flushSession,
-  _buffers as buffers,
-} from "./handler.js";
+import { after, before, beforeEach, describe, it } from "node:test";
+import type { NatsConnection } from "nats";
+import { connect, StringCodec } from "nats";
+import defaultHandler, { createHandler, type Handler, parseSessionKey } from "./handler.js";
 
 // ── Unit tests ──────────────────────────────────────────────────────
 
@@ -67,21 +64,53 @@ describe("parseSessionKey", () => {
   });
 });
 
+// ── Unit tests for createHandler encapsulation ──────────────────────
+
+describe("createHandler encapsulation", () => {
+  it("returns a handler with its own buffers", () => {
+    const h1 = createHandler();
+    const h2 = createHandler();
+    assert.notStrictEqual(h1.buffers, h2.buffers, "each handler should have its own buffers map");
+  });
+
+  it("default export has buffers and flushSession", () => {
+    assert.ok(defaultHandler.buffers instanceof Map);
+    assert.equal(typeof defaultHandler.flushSession, "function");
+  });
+});
+
 // ── Integration tests (requires live NATS) ──────────────────────────
 
-describe("handler integration", () => {
+// Attempt a probe connection to decide whether to run integration tests.
+let natsAvailable = false;
+
+try {
+  const probeOpts: { servers: string; token?: string } = {
+    servers: "nats://127.0.0.1:4222",
+  };
+  if (process.env.NATS_TOKEN) {
+    probeOpts.token = process.env.NATS_TOKEN;
+  }
+  const probeConn = await connect(probeOpts);
+  natsAvailable = true;
+  await probeConn.drain();
+} catch {
+  natsAvailable = false;
+}
+
+describe("handler integration", { skip: !natsAvailable }, () => {
   const NATS_URL = "nats://127.0.0.1:4222";
   const SUBJECT = "swarm.gateway.session.chunk";
   const SESSION_KEY = "test:+440000000000:main";
 
+  let handler: Handler;
   let sub: NatsConnection;
   const sc = StringCodec();
-  const received: any[] = [];
+  const received: Record<string, unknown>[] = [];
 
   before(async () => {
     process.env.NATS_URL = NATS_URL;
 
-    // Connect without token — works for both local (if no auth) and CI
     const connectOpts: { servers: string; token?: string } = {
       servers: NATS_URL,
     };
@@ -93,9 +122,12 @@ describe("handler integration", () => {
     const subscription = sub.subscribe(SUBJECT);
     (async () => {
       for await (const msg of subscription) {
-        received.push(JSON.parse(sc.decode(msg.data)));
+        received.push(JSON.parse(sc.decode(msg.data)) as Record<string, unknown>);
       }
     })();
+
+    // Create a fresh handler instance for integration tests
+    handler = createHandler();
 
     // Boot the handler's NATS connection
     await handler({ type: "gateway", action: "startup" });
@@ -108,7 +140,7 @@ describe("handler integration", () => {
 
   beforeEach(() => {
     received.length = 0;
-    buffers.clear();
+    handler.buffers.clear();
   });
 
   it("buffers messages on session:after", async () => {
@@ -117,16 +149,14 @@ describe("handler integration", () => {
       action: "after",
       sessionKey: SESSION_KEY,
       context: {
-        messages: [
-          { role: "user", content: "hello", timestamp: new Date().toISOString() },
-        ],
+        messages: [{ role: "user", content: "hello", timestamp: new Date().toISOString() }],
       },
     });
 
-    const buf = buffers.get(SESSION_KEY);
+    const buf = handler.buffers.get(SESSION_KEY);
     assert.ok(buf, "session buffer should exist");
     assert.equal(buf.messages.length, 1);
-    assert.equal(buf.messages[0].content, "hello");
+    assert.equal((buf.messages[0] as Record<string, unknown>).content, "hello");
   });
 
   it("accumulates messages across multiple turns", async () => {
@@ -136,14 +166,12 @@ describe("handler integration", () => {
         action: "after",
         sessionKey: SESSION_KEY,
         context: {
-          messages: [
-            { role: "user", content: `msg-${i}`, timestamp: new Date().toISOString() },
-          ],
+          messages: [{ role: "user", content: `msg-${i}`, timestamp: new Date().toISOString() }],
         },
       });
     }
 
-    const buf = buffers.get(SESSION_KEY);
+    const buf = handler.buffers.get(SESSION_KEY);
     assert.ok(buf);
     assert.equal(buf.messages.length, 3);
   });
@@ -154,9 +182,7 @@ describe("handler integration", () => {
       action: "after",
       sessionKey: SESSION_KEY,
       context: {
-        messages: [
-          { role: "assistant", content: "bye", timestamp: new Date().toISOString() },
-        ],
+        messages: [{ role: "assistant", content: "bye", timestamp: new Date().toISOString() }],
       },
     });
 
@@ -169,17 +195,18 @@ describe("handler integration", () => {
     await delay(100);
 
     assert.equal(received.length, 1, "should have received one chunk");
-    const chunk = received[0];
+    const chunk = received[0] as Record<string, unknown>;
     assert.equal(chunk.session_key, SESSION_KEY);
     assert.equal(chunk.is_final, true);
     assert.equal(chunk.flush_reason, "session_stop");
     assert.equal(chunk.message_count, 1);
-    assert.equal(chunk.messages[0].content, "bye");
+    const msgs = chunk.messages as Record<string, unknown>[];
+    assert.equal(msgs[0].content, "bye");
     assert.equal(chunk.chunk_index, 0);
     assert.ok(chunk.chunk_id, "should have a chunk_id UUID");
     assert.ok(chunk.flushed_at, "should have flushed_at timestamp");
 
-    assert.equal(buffers.has(SESSION_KEY), false);
+    assert.equal(handler.buffers.has(SESSION_KEY), false);
   });
 
   it("flushes when buffer exceeds MAX_BUFFER_MESSAGES (50)", async () => {
@@ -203,7 +230,7 @@ describe("handler integration", () => {
     assert.equal(received[0].is_final, false);
     assert.equal(received[0].message_count, 51);
 
-    const buf = buffers.get(SESSION_KEY);
+    const buf = handler.buffers.get(SESSION_KEY);
     assert.ok(buf, "session buffer should still exist");
     assert.equal(buf.messages.length, 0);
   });
@@ -249,9 +276,7 @@ describe("handler integration", () => {
       action: "after",
       sessionKey: "whatsapp:+447444361435:kai",
       context: {
-        messages: [
-          { role: "user", content: "hi", timestamp: new Date().toISOString() },
-        ],
+        messages: [{ role: "user", content: "hi", timestamp: new Date().toISOString() }],
       },
     });
 
@@ -262,10 +287,11 @@ describe("handler integration", () => {
     });
     await delay(100);
 
-    const chunk = received[0];
-    assert.equal(chunk.session_metadata.channel, "whatsapp");
-    assert.equal(chunk.session_metadata.participant, "+447444361435");
-    assert.equal(chunk.session_metadata.agent_id, "kai");
+    const chunk = received[0] as Record<string, unknown>;
+    const meta = chunk.session_metadata as Record<string, unknown>;
+    assert.equal(meta.channel, "whatsapp");
+    assert.equal(meta.participant, "+447444361435");
+    assert.equal(meta.agent_id, "kai");
   });
 
   it("command:stop on empty/nonexistent session is a no-op", async () => {
@@ -284,7 +310,7 @@ describe("handler integration", () => {
       action: "after",
       context: { messages: [{ role: "user", content: "lost" }] },
     });
-    assert.equal(buffers.size, 0);
+    assert.equal(handler.buffers.size, 0);
   });
 
   it("ignores unknown event types", async () => {
@@ -293,7 +319,7 @@ describe("handler integration", () => {
       action: "something",
       sessionKey: SESSION_KEY,
     });
-    assert.equal(buffers.size, 0);
+    assert.equal(handler.buffers.size, 0);
     assert.equal(received.length, 0);
   });
 
@@ -305,7 +331,7 @@ describe("handler integration", () => {
       context: {},
     });
 
-    const buf = buffers.get(SESSION_KEY);
+    const buf = handler.buffers.get(SESSION_KEY);
     assert.ok(buf, "session buffer should be created");
     assert.equal(buf.messages.length, 0, "no messages should be buffered");
   });
@@ -318,9 +344,9 @@ describe("handler integration", () => {
       context: { messages: [] },
     });
 
-    const buf = buffers.get(SESSION_KEY);
-    assert.ok(buf, "session buffer should be created");
-    assert.equal(buf.messages.length, 0);
+    const buf2 = handler.buffers.get(SESSION_KEY);
+    assert.ok(buf2, "session buffer should be created");
+    assert.equal(buf2.messages.length, 0);
   });
 
   it("isolates multiple concurrent sessions", async () => {
@@ -347,8 +373,12 @@ describe("handler integration", () => {
       },
     });
 
-    assert.equal(buffers.get(KEY_A)!.messages.length, 1);
-    assert.equal(buffers.get(KEY_B)!.messages.length, 2);
+    const bufA = handler.buffers.get(KEY_A);
+    const bufB = handler.buffers.get(KEY_B);
+    assert.ok(bufA);
+    assert.ok(bufB);
+    assert.equal(bufA.messages.length, 1);
+    assert.equal(bufB.messages.length, 2);
 
     // Stop only session A
     await handler({ type: "command", action: "stop", sessionKey: KEY_A });
@@ -359,8 +389,10 @@ describe("handler integration", () => {
     assert.equal(received[0].message_count, 1);
 
     // Session B still active
-    assert.ok(buffers.has(KEY_B));
-    assert.equal(buffers.get(KEY_B)!.messages.length, 2);
+    assert.ok(handler.buffers.has(KEY_B));
+    const bufB2 = handler.buffers.get(KEY_B);
+    assert.ok(bufB2);
+    assert.equal(bufB2.messages.length, 2);
 
     // Clean up session B
     await handler({ type: "command", action: "stop", sessionKey: KEY_B });
@@ -379,19 +411,25 @@ describe("handler integration", () => {
     });
 
     // Manually flush (non-final) to empty the buffer
-    await flushSession(SESSION_KEY, "manual", false);
+    await handler.flushSession(SESSION_KEY, "manual", false);
     await delay(50);
 
-    assert.ok(buffers.has(SESSION_KEY), "session should still be tracked");
-    assert.equal(buffers.get(SESSION_KEY)!.messages.length, 0);
+    assert.ok(handler.buffers.has(SESSION_KEY), "session should still be tracked");
+    const buf = handler.buffers.get(SESSION_KEY);
+    assert.ok(buf);
+    assert.equal(buf.messages.length, 0);
 
-    // Now final stop on empty buffer — should clean up without publishing
+    // Now final stop on empty buffer -- should clean up without publishing
     received.length = 0;
-    await handler({ type: "command", action: "stop", sessionKey: SESSION_KEY });
+    await handler({
+      type: "command",
+      action: "stop",
+      sessionKey: SESSION_KEY,
+    });
     await delay(50);
 
     assert.equal(received.length, 0, "should not publish an empty chunk");
-    assert.equal(buffers.has(SESSION_KEY), false, "session should be cleaned up");
+    assert.equal(handler.buffers.has(SESSION_KEY), false, "session should be cleaned up");
   });
 
   it("chunk contains valid UUID and ISO timestamp", async () => {
@@ -406,15 +444,15 @@ describe("handler integration", () => {
     await handler({ type: "command", action: "stop", sessionKey: SESSION_KEY });
     await delay(100);
 
-    const chunk = received[0];
+    const chunk = received[0] as Record<string, unknown>;
     assert.match(
-      chunk.chunk_id,
+      chunk.chunk_id as string,
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
-      "chunk_id should be a valid UUID"
+      "chunk_id should be a valid UUID",
     );
     assert.ok(
-      !isNaN(Date.parse(chunk.flushed_at)),
-      "flushed_at should be a valid ISO timestamp"
+      !Number.isNaN(Date.parse(chunk.flushed_at as string)),
+      "flushed_at should be a valid ISO timestamp",
     );
   });
 
@@ -427,14 +465,17 @@ describe("handler integration", () => {
       action: "after",
       sessionKey: SESSION_KEY,
       context: {
-        messages: [{ role: "user", content: "after double startup", timestamp: new Date().toISOString() }],
+        messages: [
+          { role: "user", content: "after double startup", timestamp: new Date().toISOString() },
+        ],
       },
     });
     await handler({ type: "command", action: "stop", sessionKey: SESSION_KEY });
     await delay(100);
 
     assert.equal(received.length, 1);
-    assert.equal(received[0].messages[0].content, "after double startup");
+    const idempotentMsgs = received[0].messages as Record<string, unknown>[];
+    assert.equal(idempotentMsgs[0].content, "after double startup");
   });
 });
 
@@ -442,6 +483,11 @@ describe("handler integration", () => {
 
 describe("Alexandria token fallback", () => {
   const originalFetch = globalThis.fetch;
+  let alexHandler: Handler;
+
+  before(() => {
+    alexHandler = createHandler();
+  });
 
   after(() => {
     globalThis.fetch = originalFetch;
@@ -449,11 +495,51 @@ describe("Alexandria token fallback", () => {
 
   it("handler still works when Alexandria is unreachable (env fallback)", async () => {
     process.env.NATS_TOKEN = "test-token";
-    globalThis.fetch = (() =>
-      Promise.reject(new Error("connection refused"))) as any;
+    globalThis.fetch = (() => Promise.reject(new Error("connection refused"))) as typeof fetch;
 
-    await handler({ type: "gateway", action: "startup" });
+    await alexHandler({ type: "gateway", action: "startup" });
     delete process.env.NATS_TOKEN;
+  });
+});
+
+// ── Reconnection handling ───────────────────────────────────────────
+
+describe("reconnection handling", { skip: !natsAvailable }, () => {
+  let reconHandler: Handler;
+
+  before(() => {
+    reconHandler = createHandler();
+  });
+
+  it("re-establishes connection on session:after when NATS disconnected", async () => {
+    // Buffer a message -- this triggers lazy initNats if nc is null
+    // (the handler sets nc = null on connection close)
+    await reconHandler({
+      type: "session",
+      action: "after",
+      sessionKey: "reconnect:test:main",
+      context: {
+        messages: [
+          {
+            role: "user",
+            content: "after reconnect",
+            timestamp: new Date().toISOString(),
+          },
+        ],
+      },
+    });
+
+    const buf = reconHandler.buffers.get("reconnect:test:main");
+    assert.ok(buf, "buffer should exist after lazy reconnect");
+    assert.equal(buf.messages.length, 1);
+
+    // Clean up
+    await reconHandler({
+      type: "command",
+      action: "stop",
+      sessionKey: "reconnect:test:main",
+    });
+    await delay(50);
   });
 });
 

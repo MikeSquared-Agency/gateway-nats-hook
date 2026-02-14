@@ -9,5 +9,5 @@
     "skipLibCheck": false,
     "lib": ["ES2022"]
   },
-  "include": ["handler.ts"]
+  "include": ["handler.ts", "handler.test.ts"]
 }
